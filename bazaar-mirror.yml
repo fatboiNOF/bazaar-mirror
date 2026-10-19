@@ -1,0 +1,84 @@
+# .github/workflows/bazaar-mirror.yml
+#
+# Mirrors Hypixel's full SkyBlock bazaar snapshot to a URL you control, every 5 minutes.
+#
+# WHAT IT DOES
+#   1. On a 5-minute cron, fetches https://api.hypixel.net/skyblock/bazaar
+#   2. Writes it verbatim to  public/skyblock/bazaar.json
+#   3. Commits and pushes  ->  GitHub Pages serves it at
+#         https://<your-user>.github.io/<your-repo>/skyblock/bazaar.json
+#
+# SETUP (about 10 minutes)
+#   1. Create a NEW PUBLIC repo (e.g. "bazaar-mirror").
+#   2. Put this file at  .github/workflows/bazaar-mirror.yml
+#   3. Repo -> Settings -> Pages -> Source: "Deploy from a branch",
+#      Branch: main   /   Folder: / (root).   Save.
+#      (If you prefer /docs, change PUBLIC_DIR below to "docs".)
+#   4. Wait for the first run: Actions tab -> "bazaar mirror" -> Run workflow (or wait 5 min).
+#   5. Your feed URL is:
+#         https://<your-user>.github.io/bazaar-mirror/skyblock/bazaar.json
+#      Give that URL to the assistant and it will be wired into the filter pipeline.
+#
+# NOTES
+#   - Hypixel's public bazaar endpoint needs NO API key.
+#   - Public repos: Actions minutes are free. Commit-back is rate-limited by concurrency
+#     below; if GitHub ever complains about too many pushes, switch the branch to a
+#     rolling "data" orphan branch or use a Pages artifact deploy instead of committing.
+#   - Keep the repo PUBLIC: a private repo's Pages site needs auth, which the assistant
+#     cannot do.
+name: bazaar mirror
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes (GitHub may delay a few minutes under load)
+  workflow_dispatch:         # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bazaar-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch Hypixel bazaar snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p public/skyblock
+          # --fail so a 5xx/HTML error page never overwrites good data
+          code=$(curl -sS -w '%{http_code}' --max-time 60 --retry 3 --retry-delay 3 \
+                 -o public/skyblock/bazaar.json.new \
+                 https://api.hypixel.net/skyblock/bazaar || true)
+          if [ "$code" != "200" ]; then
+            echo "Hypixel returned HTTP $code - keeping previous snapshot"; exit 0
+          fi
+          # sanity: must be JSON with a products object and >1500 items
+          python3 - <<'PY'
+          import json, sys
+          p = "public/skyblock/bazaar.json.new"
+          d = json.load(open(p))
+          assert d.get("success") is True, "success flag missing"
+          n = len(d.get("products", {}))
+          assert n > 1500, f"only {n} products - refusing to publish"
+          print(f"ok: {n} products, lastUpdated={d.get('lastUpdated')}")
+          PY
+          mv public/skyblock/bazaar.json.new public/skyblock/bazaar.json
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name  "bazaar-mirror-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add public/skyblock/bazaar.json
+          if git diff --cached --quiet; then
+            echo "no change"; exit 0
+          fi
+          git commit -m "bazaar snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
