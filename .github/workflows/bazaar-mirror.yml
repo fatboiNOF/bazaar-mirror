@@ -1,0 +1,95 @@
+# .github/workflows/bazaar-mirror.yml
+#
+# Mirrors Hypixel's full SkyBlock bazaar snapshot to a URL you control, every 5 minutes.
+#
+# It publishes using GitHub's PAGES ARTIFACT pipeline (not a branch folder), so:
+#   - no "which folder?" confusion   - no /public prefix in the URL   - no empty-index 404s
+#
+# RESULTING FEED URL:
+#   https://<your-user>.github.io/<your-repo>/bazaar.json
+#
+# SETUP (see BAZAAR_MIRROR_SETUP.md for the click-by-click)
+#   1. Create a PUBLIC repo, e.g. "bazaar-mirror".
+#   2. Put this file at  .github/workflows/bazaar-mirror.yml
+#   3. That's it. The workflow deploys the Pages site itself.
+#      (Repo -> Settings -> Pages -> Source must be "GitHub Actions".)
+name: bazaar mirror
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes (GitHub may delay a few min under load)
+  workflow_dispatch:         # manual trigger from the Actions tab
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bazaar-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare site dir
+        run: mkdir -p site
+
+      - name: Fetch Hypixel bazaar snapshot
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -w '%{http_code}' --max-time 60 --retry 3 --retry-delay 3 \
+                 -o site/bazaar.json.new \
+                 https://api.hypixel.net/skyblock/bazaar || true)
+          if [ "$code" != "200" ]; then
+            echo "Hypixel returned HTTP $code"
+            # keep a previously committed copy if we have one
+            if [ -f site/bazaar.json ]; then rm -f site/bazaar.json.new; else exit 1; fi
+          else
+            python3 - <<'PY'
+          import json
+          d = json.load(open("site/bazaar.json.new"))
+          assert d.get("success") is True, "success flag missing"
+          n = len(d.get("products", {}))
+          assert n > 1500, f"only {n} products - refusing to publish"
+          print(f"ok: {n} products, lastUpdated={d.get('lastUpdated')}")
+          PY
+            mv site/bazaar.json.new site/bazaar.json
+          fi
+
+      - name: Write index.html (so / resolves)
+        run: |
+          set -euo pipefail
+          TS=$(python3 -c "import json;print(json.load(open('site/bazaar.json')).get('lastUpdated',''))")
+          cat > site/index.html <<HTML
+          <!doctype html><meta charset="utf-8">
+          <title>bazaar mirror</title>
+          <h1>Hypixel bazaar mirror</h1>
+          <p>Feed: <a href="./bazaar.json">./bazaar.json</a></p>
+          <p>lastUpdated: <code>${TS}</code></p>
+          <p>Refreshed every 5 minutes by GitHub Actions.</p>
+          HTML
+          ls -la site
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
